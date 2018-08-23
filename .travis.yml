@@ -1,0 +1,71 @@
+language: cpp
+
+os:
+    - linux
+    - osx
+
+sudo: required
+dist: trusty   # Use ubuntu 14.04 for qt5 support
+
+compiler:
+    - gcc
+    - clang
+
+env:
+    matrix:
+        - DISPLAZ_BUILD_TYPE=Release
+        - DISPLAZ_BUILD_TYPE=Debug
+
+# either whitelist or blacklist branches
+branches:
+    only:
+        - master
+#     except:
+#         - experimental
+
+before_install:
+    - if [ "$TRAVIS_OS_NAME" == "linux" ]; then sudo apt-get update -qq; fi
+    - if [ "$TRAVIS_OS_NAME" == "osx" ]; then brew update; fi
+
+install:
+    - >
+      if [ "$TRAVIS_OS_NAME" == "linux" ]; then
+        sudo apt-get install -qq -y git g++ cmake qt5-default python-docutils
+      fi
+    - >
+      if [ "$TRAVIS_OS_NAME" == "osx" ]; then
+        # There seems to be some inconsistency about whether git is installed
+        # on OSX worker nodes.  See https://github.com/github/git-lfs/pull/1557
+        brew ls --versions git && brew upgrade git || brew install git
+        brew install qt5
+        brew unlink qt5
+        brew link qt5 --force
+      fi
+before_script:
+    # Build external tools
+    - mkdir -p build_external
+    - cd build_external
+    - cmake ../thirdparty/external
+    - make -j4
+    - cd ..
+    - if [ "$TRAVIS_OS_NAME" == "osx" ]; then export PATH=/usr/local/opt/qt5/bin:$PATH; fi
+
+script:
+    # Build displaz
+    - mkdir -p build
+    - cd build
+    - cmake -DCMAKE_BUILD_TYPE=${DISPLAZ_BUILD_TYPE} ..
+    - make -j4
+    # NB: IPC lock test disabled on OSX so that the whole build doesn't fail
+    # Needs investigation by someone with an OSX machine.
+    - if [ "$TRAVIS_OS_NAME" == "osx" ] ; then ctest -VV -E InterProcessLock_test ; fi
+    - if [ "$TRAVIS_OS_NAME" != "osx" ] ; then ctest -VV ; fi
+    - cd ..
+
+matrix:
+    exclude:
+        # Only check gcc on linux and clang on OS X
+        - os: linux
+          compiler: clang
+        - os: osx
+          compiler: gcc
