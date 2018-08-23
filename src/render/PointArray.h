@@ -1,0 +1,90 @@
+// Copyright 2015, Christopher J. Foster and the other displaz contributors.
+// Use of this code is governed by the BSD-style license found in LICENSE.txt
+
+#ifndef DISPLAZ_POINTARRAY_H_INCLUDED
+#define DISPLAZ_POINTARRAY_H_INCLUDED
+
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "Geometry.h"
+#include "typespec.h"
+#include "geomfield.h"
+#include "GeometryMutator.h"
+
+class QGLShaderProgram;
+
+struct OctreeNode;
+struct TransformState;
+
+//------------------------------------------------------------------------------
+/// Container for points to be displayed in the View3D interface
+class PointArray : public Geometry
+{
+    Q_OBJECT
+
+    public:
+        PointArray();
+        ~PointArray();
+
+        // Overridden Geometry functions
+        virtual bool loadFile(QString fileName, size_t maxVertexCount);
+
+        virtual void mutate(std::shared_ptr<GeometryMutator> mutator);
+
+        virtual void draw(const TransformState& transState, double quality) const;
+
+        virtual void initializeGL();
+
+        virtual DrawCount drawPoints(QGLShaderProgram& prog,
+                                    const TransformState& transState,
+                                    double quality, bool incrementalDraw) const;
+
+        virtual size_t pointCount() const { return m_npoints; }
+
+        virtual void estimateCost(const TransformState& transState,
+                                  bool incrementalDraw, const double* qualities,
+                                  DrawCount* drawCounts, int numEstimates) const;
+
+        virtual bool pickVertex(const V3d& cameraPos,
+                                const EllipticalDist& distFunc,
+                                V3d& pickedVertex,
+                                double* distance = 0,
+                                std::string* info = 0) const;
+
+        /// Draw a representation of the point hierarchy.
+        ///
+        /// Probably only useful for debugging.
+        void drawTree(QGLShaderProgram& prog, const TransformState& transState) const;
+
+    private:
+        bool loadLas(QString fileName, size_t maxPointCount,
+                     std::vector<GeomField>& fields, V3d& offset,
+                     size_t& npoints, uint64_t& totalPoints);
+
+        bool loadText(QString fileName, size_t maxPointCount,
+                      std::vector<GeomField>& fields, V3d& offset,
+                      size_t& npoints, uint64_t& totalPoints);
+
+        bool loadPly(QString fileName, size_t maxPointCount,
+                     std::vector<GeomField>& fields, V3d& offset,
+                     size_t& npoints, uint64_t& totalPoints);
+
+        friend struct ProgressFunc;
+
+        /// Total number of loaded points
+        size_t m_npoints;
+        /// Spatial hierarchy
+        std::unique_ptr<OctreeNode> m_rootNode;
+        /// Point data field storage
+        std::vector<GeomField> m_fields;
+        /// A position field is required.  Alias for convenience:
+        int m_positionFieldIdx;
+        V3f* m_P;
+        std::unique_ptr<uint32_t[]> m_inds;
+};
+
+
+#endif // DISPLAZ_POINTARRAY_H_INCLUDED

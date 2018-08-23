@@ -1,0 +1,213 @@
+// Copyright 2015, Christopher J. Foster and the other displaz contributors.
+// Use of this code is governed by the BSD-style license found in LICENSE.txt
+
+#ifndef STREAM_PAGE_CACHE_H_INCLUDED
+#define STREAM_PAGE_CACHE_H_INCLUDED
+
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <string.h>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "util.h"
+
+/// Application controlled page cache for access to raw file data
+///
+/// This interface allows the application to specify data to be fetched, along
+/// with a priority for the data.
+class StreamPageCache
+{
+    public:
+        typedef uint64_t PosType;
+
+        StreamPageCache(std::istream& input, PosType pageSize = 512*1024)
+            : m_input(input),
+            m_pageSize(pageSize)
+        {
+            m_input.seekg(0, std::ios::end);
+            m_fileSize = static_cast<PosType>(m_input.tellg());
+            m_input.seekg(0);
+            if (!m_input)
+                throw DisplazError("Page cache could not open file");
+        }
+
+        /// Mark pages overlapping the given range for fetching
+        ///
+        /// Page priority is taken as the maximum of any fetch requests which
+        /// overlap the given page.
+        ///
+        /// prefetch() does not do any actual fetching of data;  it returns
+        /// immediately with status indicating whether the data is already
+        /// present in the cache.
+        bool prefetch(PosType offset, PosType length, double priority = 0)
+        {
+            if (offset + length > m_fileSize)
+            {
+                throw DisplazError("Prefetch request at %d past end of file %d",
+                                   offset+length, m_fileSize);
+            }
+            PosType pagesBegin = pageIndex(offset);
+            PosType pagesEnd = pageIndex(offset + length - 1) + 1;
+            bool inCache = true;
+            for (PosType pageIdx = pagesBegin; pageIdx < pagesEnd; ++pageIdx)
+            {
+                auto page = m_pages.find(pageIdx);
+                if (page == m_pages.end())
+                {
+                    auto pendingPage = m_pendingPages.find(pageIdx);
+                    if (pendingPage == m_pendingPages.end())
+                        m_pendingPages[pageIdx] = priority;
+                    else if (pendingPage->second < priority)
+                        pendingPage->second = priority;
+                    inCache = false;
+                }
+            }
+            return inCache;
+        }
+
+        /// Attempt to read length bytes into buf, starting at offset
+        ///
+        /// If the byte range is not in the cache, return false (the user may
+        /// call prefetch() to bring these into cache)
+        bool read(char* buf, PosType offset, PosType length)
+        {
+            PosType pagesBegin = pageIndex(offset);
+            PosType pagesEnd = pageIndex(offset + length - 1) + 1;
+            //tfm::printf("read(): pagesBegin = %d, pagesEnd = %d\n", pagesBegin, pagesEnd);
+            for (PosType pageIdx = pagesBegin; pageIdx < pagesEnd; ++pageIdx)
+            {
+                auto page = m_pages.find(pageIdx);
+                if (page == m_pages.end())
+                {
+                    //tfm::printf("Didn't find page %d\n", pageIdx);
+                    return false;
+                }
+                PosType pageOffsetBegin = pageIdx * m_pageSize;
+                PosType pageOffsetEnd   = (pageIdx+1) * m_pageSize;
+                // Range of bytes to copy within page
+                PosType byteBegin = (pageOffsetBegin < offset) ?
+                                    offset - pageOffsetBegin : 0;
+                PosType byteEnd   = (pageOffsetEnd > offset + length) ?
+                                    offset + length - pageOffsetBegin : m_pageSize;
+                PosType nbytes = byteEnd - byteBegin;
+                //tfm::printf("read(): byteBegin = %d, byteEnd = %d\n", byteBegin, byteEnd);
+                memcpy(buf, page->second.get() + byteBegin, nbytes);
+                buf += nbytes;
+            }
+            return true;
+        }
+
+        /// Fetch a bunch of pages which have been previously marked.
+        ///
+        /// Eventually this will probably happen in the background
+        size_t fetchNow(size_t numFetch)
+        {
+            typedef std::pair<double, PosType> PendingPage;
+            std::vector<PendingPage> priorityPages;
+            for (auto p = m_pendingPages.begin(); p != m_pendingPages.end(); ++p)
+                priorityPages.push_back(PendingPage(p->second, p->first));
+            numFetch = std::min(numFetch, priorityPages.size());
+            std::nth_element(priorityPages.begin(), priorityPages.begin() + numFetch,
+                             priorityPages.end(), std::greater<PendingPage>());
+            for (size_t i = 0; i < numFetch; ++i)
+            {
+                PosType pageIdx = priorityPages[i].second;
+                std::unique_ptr<char[]>& buf = m_pages[pageIdx];
+                assert(!buf);
+                buf.reset(new char[m_pageSize]);
+                PosType pageOffset = pageIdx*m_pageSize;
+                m_input.seekg(pageOffset);
+                m_input.read(buf.get(), std::min(m_pageSize, m_fileSize - pageOffset));
+                m_pendingPages.erase(pageIdx);
+            }
+            return numFetch;
+        }
+
+    private:
+        PosType pageIndex(PosType address) const
+        {
+            return address/m_pageSize;
+        }
+
+        std::istream& m_input;
+        PosType m_pageSize;
+        PosType m_fileSize;
+        std::unordered_map<PosType, double> m_pendingPages;
+        std::unordered_map<PosType, std::unique_ptr<char[]>> m_pages;
+};
+
+
+//------------------------------------------------------------------------------
+/// Stream-like interface on top of a page cache (how circular...)
+///
+/// Construct one of these to read consecutive bytes from a cache, without
+/// having to manually keep track of the offset and whether all the reads
+/// succeeded.
+class PageCacheReader
+{
+    public:
+        PageCacheReader(StreamPageCache& cache, uint64_t offset = 0)
+            : m_cache(cache),
+            m_initialOffset(offset),
+            m_offset(offset),
+            m_bad(false)
+        { }
+
+        /// Return true if any previous read() operation failed
+        bool bad() const
+        {
+            return m_bad;
+        }
+
+        /// Return total bytes which we attempted to read from the stream.
+        ///
+        /// This is accurate regardless of the return value of `bad()`.
+        uint64_t attemptedBytesRead() const
+        {
+            return m_offset - m_initialOffset;
+        }
+
+        /// Read bytes from stream into the supplied buffer
+        ///
+        /// If the stream is already bad, read zero bytes, but increment the
+        /// offset.  Return true on success.
+        bool read(char* buf, size_t size)
+        {
+            if (!m_bad)
+            {
+                if (!m_cache.read(buf, m_offset, size))
+                    m_bad = true;
+            }
+            m_offset += size;
+            return !m_bad;
+        }
+
+        /// If not bad, resize array to `size` and attempt to read `size`
+        /// elements from the stream in native endian binary form.
+        ///
+        /// If the stream is already bad, read zero bytes, but increment the
+        /// offset.  Return true on success.
+        template<typename T>
+        bool read(std::unique_ptr<T[]>& array, size_t size)
+        {
+            if (!m_bad)
+                array.reset(new T[size]);
+            return read((char*)array.get(), size*sizeof(T));
+        }
+
+    private:
+        StreamPageCache& m_cache;
+        uint64_t m_initialOffset;
+        uint64_t m_offset;
+        bool m_bad;
+};
+
+
+#endif // STREAM_PAGE_CACHE_H_INCLUDED
